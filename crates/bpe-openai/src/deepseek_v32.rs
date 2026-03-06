@@ -125,6 +125,7 @@ struct ParsedMessage {
     response_format: Option<Value>,
     tool_calls: Vec<ToolCall>,
     reasoning_content: Option<String>,
+    dropped_reasoning: bool,
 }
 
 impl Message {
@@ -154,6 +155,7 @@ pub fn apply_chat_template(
             response_format: None,
             tool_calls: Vec::new(),
             reasoning_content: None,
+            dropped_reasoning: false,
         });
     }
 
@@ -212,6 +214,7 @@ fn process_messages(messages: &[Message], drop_thinking: bool) -> Vec<ParsedMess
                 response_format: msg.response_format.clone(),
                 tool_calls: normalize_tool_calls(msg.tool_calls.as_deref().unwrap_or(&[])),
                 reasoning_content: msg.reasoning_content.clone(),
+                dropped_reasoning: false,
             });
             continue;
         }
@@ -237,6 +240,7 @@ fn process_messages(messages: &[Message], drop_thinking: bool) -> Vec<ParsedMess
                 response_format: None,
                 tool_calls,
                 reasoning_content: msg.reasoning_content.clone(),
+                dropped_reasoning: false,
             });
             continue;
         }
@@ -248,6 +252,7 @@ fn process_messages(messages: &[Message], drop_thinking: bool) -> Vec<ParsedMess
             response_format: None,
             tool_calls: Vec::new(),
             reasoning_content: None,
+            dropped_reasoning: false,
         });
     }
 
@@ -370,8 +375,10 @@ fn render_message(
             };
 
             let summary_content = message.content.as_str();
+            let is_pending_assistant =
+                thinking_mode == ThinkingMode::Thinking && (index as isize) > last_user_idx;
             let mut thinking_part = THINKING_END_TOKEN.to_string();
-            if thinking_mode == ThinkingMode::Thinking && (index as isize) > last_user_idx {
+            if is_pending_assistant {
                 if message
                     .reasoning_content
                     .as_deref()
@@ -388,14 +395,25 @@ fn render_message(
                 );
             }
 
-            prompt.push_str(&format!(
-                "{assistant}<think>{reasoning}{tool_calls}{content}{eos}",
-                assistant = ASSISTANT_TOKEN,
-                reasoning = thinking_part,
-                tool_calls = tool_calls,
-                content = summary_content,
-                eos = EOS_TOKEN,
-            ));
+            if message.dropped_reasoning && !is_pending_assistant {
+                prompt.push_str(&format!(
+                    "{assistant}{reasoning}{tool_calls}{content}{eos}",
+                    assistant = ASSISTANT_TOKEN,
+                    reasoning = thinking_part,
+                    tool_calls = tool_calls,
+                    content = summary_content,
+                    eos = EOS_TOKEN,
+                ));
+            } else {
+                prompt.push_str(&format!(
+                    "{assistant}<think>{reasoning}{tool_calls}{content}{eos}",
+                    assistant = ASSISTANT_TOKEN,
+                    reasoning = thinking_part,
+                    tool_calls = tool_calls,
+                    content = summary_content,
+                    eos = EOS_TOKEN,
+                ));
+            }
         }
         "system" => {
             prompt.push_str(&format!(
@@ -536,6 +554,17 @@ fn find_last_user_index(messages: &[ParsedMessage]) -> Option<usize> {
 }
 
 fn drop_thinking_messages(messages: &mut Vec<ParsedMessage>) {
+    for message in messages.iter_mut() {
+        let has_reasoning = message
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|reasoning| !reasoning.is_empty());
+        if message.role == "assistant" && has_reasoning && !message.content.is_empty() {
+            message.reasoning_content = None;
+            message.dropped_reasoning = true;
+        }
+    }
+
     let mut assistant_start_idx: Option<usize> = None;
     let mut index = 0usize;
 
@@ -750,6 +779,28 @@ mod tests {
 
         assert!(!prompt.contains("draft reasoning"));
         assert!(prompt.contains("<\u{ff5c}User\u{ff5c}>question"));
+    }
+
+    #[test]
+    fn test_drop_thinking_keeps_closed_think_tag_for_completed_assistant() {
+        let messages = vec![
+            Message::new("user", "hello"),
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Hello! I am DeepSeek.".to_string()),
+                reasoning_content: Some("thinking...".to_string()),
+                ..Message::default()
+            },
+            Message::new("user", "1+1=?"),
+        ];
+
+        let prompt = apply_chat_template(&messages, ThinkingMode::Thinking, None, true, true)
+            .expect("apply_chat_template should succeed");
+
+        assert_eq!(
+            prompt,
+            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>hello<\u{ff5c}Assistant\u{ff5c}></think>Hello! I am DeepSeek.<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>1+1=?<\u{ff5c}Assistant\u{ff5c}><think>"
+        );
     }
 
     #[test]
