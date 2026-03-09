@@ -9,7 +9,6 @@ const BOS_TOKEN: &str = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
 const EOS_TOKEN: &str = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
 const USER_TOKEN: &str = "<\u{ff5c}User\u{ff5c}>";
 const ASSISTANT_TOKEN: &str = "<\u{ff5c}Assistant\u{ff5c}>";
-const SYSTEM_TOKEN: &str = "<\u{ff5c}System\u{ff5c}>";
 const TOOL_CALL_BEGIN_TOKEN: &str = "<\u{ff5c}tool\u{2581}call\u{2581}begin\u{ff5c}>";
 const TOOL_CALL_END_TOKEN: &str = "<\u{ff5c}tool\u{2581}call\u{2581}end\u{ff5c}>";
 const TOOL_SEP_TOKEN: &str = "<\u{ff5c}tool\u{2581}sep\u{ff5c}>";
@@ -159,11 +158,13 @@ pub fn apply_chat_template(
         });
     }
 
+    let should_drop_thinking = drop_thinking && thinking_mode == ThinkingMode::Thinking;
+
     if let Some(context_messages) = context {
-        all_messages.extend(process_messages(context_messages, drop_thinking));
+        all_messages.extend(process_messages(context_messages, should_drop_thinking));
     }
 
-    all_messages.extend(process_messages(messages, drop_thinking));
+    all_messages.extend(process_messages(messages, should_drop_thinking));
 
     let last_user_idx = find_last_user_index(&all_messages)
         .map(|idx| idx as isize)
@@ -181,6 +182,18 @@ pub fn apply_chat_template(
     }
 
     Ok(prompt)
+}
+
+fn should_append_assistant_prompt(
+    index: usize,
+    all_messages: &[ParsedMessage],
+    last_user_idx: isize,
+) -> bool {
+    if index + 1 < all_messages.len() && all_messages[index + 1].role == "assistant" {
+        return true;
+    }
+
+    index as isize == last_user_idx && index + 1 == all_messages.len()
 }
 
 pub fn tokenize_messages(
@@ -377,7 +390,7 @@ fn render_message(
             let summary_content = message.content.as_str();
             let is_pending_assistant =
                 thinking_mode == ThinkingMode::Thinking && (index as isize) > last_user_idx;
-            let mut thinking_part = THINKING_END_TOKEN.to_string();
+            let mut thinking_part = String::new();
             if is_pending_assistant {
                 if message
                     .reasoning_content
@@ -395,32 +408,16 @@ fn render_message(
                 );
             }
 
-            if message.dropped_reasoning && !is_pending_assistant {
-                prompt.push_str(&format!(
-                    "{assistant}{reasoning}{tool_calls}{content}{eos}",
-                    assistant = ASSISTANT_TOKEN,
-                    reasoning = thinking_part,
-                    tool_calls = tool_calls,
-                    content = summary_content,
-                    eos = EOS_TOKEN,
-                ));
-            } else {
-                prompt.push_str(&format!(
-                    "{assistant}<think>{reasoning}{tool_calls}{content}{eos}",
-                    assistant = ASSISTANT_TOKEN,
-                    reasoning = thinking_part,
-                    tool_calls = tool_calls,
-                    content = summary_content,
-                    eos = EOS_TOKEN,
-                ));
-            }
+            prompt.push_str(&format!(
+                "{reasoning}{content}{tool_calls}{eos}",
+                reasoning = thinking_part,
+                content = summary_content,
+                tool_calls = tool_calls,
+                eos = EOS_TOKEN,
+            ));
         }
         "system" => {
-            prompt.push_str(&format!(
-                "{system}{content}",
-                system = SYSTEM_TOKEN,
-                content = message.content,
-            ));
+            prompt.push_str(&message.content);
 
             if !message.tools.is_empty() {
                 let tools = message
@@ -488,7 +485,7 @@ fn render_message(
                 content = content_developer,
             ));
 
-            if index as isize == last_user_idx && index + 1 == all_messages.len() {
+            if should_append_assistant_prompt(index, all_messages, last_user_idx) {
                 prompt.push_str(ASSISTANT_TOKEN);
                 if thinking_mode == ThinkingMode::Thinking {
                     prompt.push_str(THINKING_START_TOKEN);
@@ -504,7 +501,7 @@ fn render_message(
                 content = message.content,
             ));
 
-            if index as isize == last_user_idx && index + 1 == all_messages.len() {
+            if should_append_assistant_prompt(index, all_messages, last_user_idx) {
                 prompt.push_str(ASSISTANT_TOKEN);
                 if thinking_mode == ThinkingMode::Thinking {
                     prompt.push_str(THINKING_START_TOKEN);
@@ -799,7 +796,76 @@ mod tests {
 
         assert_eq!(
             prompt,
-            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>hello<\u{ff5c}Assistant\u{ff5c}></think>Hello! I am DeepSeek.<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>1+1=?<\u{ff5c}Assistant\u{ff5c}><think>"
+            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>hello<\u{ff5c}Assistant\u{ff5c}><think>Hello! I am DeepSeek.<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>1+1=?<\u{ff5c}Assistant\u{ff5c}><think>"
+        );
+    }
+
+    #[test]
+    fn test_drop_thinking_keeps_closed_think_tag_for_completed_assistant_in_chat_mode() {
+        let messages = vec![
+            Message::new("user", "hello"),
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Hello! I am DeepSeek.".to_string()),
+                reasoning_content: Some("thinking...".to_string()),
+                ..Message::default()
+            },
+            Message::new("user", "1+1=?"),
+        ];
+
+        let prompt = apply_chat_template(&messages, ThinkingMode::Chat, None, true, true)
+            .expect("apply_chat_template should succeed");
+
+        assert_eq!(
+            prompt,
+            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>hello<\u{ff5c}Assistant\u{ff5c}></think>Hello! I am DeepSeek.<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>1+1=?<\u{ff5c}Assistant\u{ff5c}></think>"
+        );
+    }
+
+    #[test]
+    fn test_chat_mode_does_not_drop_pre_user_reasoning_only_assistant() {
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                reasoning_content: Some("draft reasoning".to_string()),
+                ..Message::default()
+            },
+            Message::new("user", "question"),
+        ];
+
+        let prompt = apply_chat_template(&messages, ThinkingMode::Chat, None, true, true)
+            .expect("apply_chat_template should succeed");
+
+        assert_eq!(
+            prompt,
+            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>question<\u{ff5c}Assistant\u{ff5c}></think>"
+        );
+    }
+
+    #[test]
+    fn test_system_and_historical_assistant_match_upstream_chat_template() {
+        let messages = vec![
+            Message::new(
+                "system",
+                "You are a concise assistant that preserves formatting.",
+            ),
+            Message::new(
+                "user",
+                "The Complete Works of William Shakespeare \nWelcome to the Web's first edition of \nthe Complete Works of William \nShakespeare. This site has offered \nShakespeare's plays and poetry to the \nInternet community since 1993. \nAnnouncement: The restoration of the site \nfollowing a disk failure has been delayed. The \ntext of the plays is available now. The poetry \nand other services, including the search engine \nand forums, will return shortly. (Nov. 13, 2000) \nFor other Shakespeare resources, visit the Mr. \nWilliam Shakespeare and the Internet Web site. \nThe original electronic source for this server is \nthe Complete Moby(tm) Shakespeare, which is \nfreely available online. The HTML versions of \nthe plays provided here are placed in the public \ndomain. \nOlder news items \nComedy History Tragedy Poetry \n\x0c\nAll's Well That Ends Well \nAs You Like It \nThe Comedy of Errors \nCymbeline \nLove's Labours Lost \nMeasure for Measure \nThe Merry Wives of Windsor \nThe Merchant of Venice \nA Midsummer Night's Dre",
+            ),
+            Message::new(
+                "assistant",
+                "The Complete Works of William Shakespeare \nWelcome to the Web's first edition of \nthe Complete Works of William \nShakespeare. This site has offered \nShakespeare's plays and poetry to the \nInternet community since 1993. \nAnnouncement: The restoration of the site \nfollowing a disk failure has been delayed. The \ntext of the plays is available now. The poetry \nand other services, including the search engine \nand forums, will return shortly. (Nov. 13, 2000) \nFor other Shakespeare resources, visit the",
+            ),
+            Message::new("user", "Summarize the previous exchange in three bullets."),
+        ];
+
+        let prompt = apply_chat_template(&messages, ThinkingMode::Chat, None, true, true)
+            .expect("apply_chat_template should succeed");
+
+        assert_eq!(
+            prompt,
+            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>You are a concise assistant that preserves formatting.<\u{ff5c}User\u{ff5c}>The Complete Works of William Shakespeare \nWelcome to the Web's first edition of \nthe Complete Works of William \nShakespeare. This site has offered \nShakespeare's plays and poetry to the \nInternet community since 1993. \nAnnouncement: The restoration of the site \nfollowing a disk failure has been delayed. The \ntext of the plays is available now. The poetry \nand other services, including the search engine \nand forums, will return shortly. (Nov. 13, 2000) \nFor other Shakespeare resources, visit the Mr. \nWilliam Shakespeare and the Internet Web site. \nThe original electronic source for this server is \nthe Complete Moby(tm) Shakespeare, which is \nfreely available online. The HTML versions of \nthe plays provided here are placed in the public \ndomain. \nOlder news items \nComedy History Tragedy Poetry \n\x0c\nAll's Well That Ends Well \nAs You Like It \nThe Comedy of Errors \nCymbeline \nLove's Labours Lost \nMeasure for Measure \nThe Merry Wives of Windsor \nThe Merchant of Venice \nA Midsummer Night's Dre<\u{ff5c}Assistant\u{ff5c}></think>The Complete Works of William Shakespeare \nWelcome to the Web's first edition of \nthe Complete Works of William \nShakespeare. This site has offered \nShakespeare's plays and poetry to the \nInternet community since 1993. \nAnnouncement: The restoration of the site \nfollowing a disk failure has been delayed. The \ntext of the plays is available now. The poetry \nand other services, including the search engine \nand forums, will return shortly. (Nov. 13, 2000) \nFor other Shakespeare resources, visit the<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>Summarize the previous exchange in three bullets.<\u{ff5c}Assistant\u{ff5c}></think>"
         );
     }
 
