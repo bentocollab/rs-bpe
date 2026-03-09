@@ -116,15 +116,24 @@ struct ToolCall {
     arguments: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedRole {
+    Bos,
+    User,
+    Assistant,
+    System,
+    Developer,
+    Tool,
+}
+
 #[derive(Debug, Clone)]
 struct ParsedMessage {
-    role: String,
+    role: ParsedRole,
     content: String,
     tools: Vec<ToolDefinition>,
     response_format: Option<Value>,
     tool_calls: Vec<ToolCall>,
     reasoning_content: Option<String>,
-    dropped_reasoning: bool,
 }
 
 impl Message {
@@ -148,13 +157,12 @@ pub fn apply_chat_template(
 
     if add_default_bos_token {
         all_messages.push(ParsedMessage {
-            role: "bos".to_string(),
+            role: ParsedRole::Bos,
             content: String::new(),
             tools: Vec::new(),
             response_format: None,
             tool_calls: Vec::new(),
             reasoning_content: None,
-            dropped_reasoning: false,
         });
     }
 
@@ -170,7 +178,7 @@ pub fn apply_chat_template(
         .map(|idx| idx as isize)
         .unwrap_or(-1);
 
-    let mut prompt = String::new();
+    let mut prompt = String::with_capacity(estimate_prompt_capacity(&all_messages));
     for (index, message) in all_messages.iter().enumerate() {
         prompt.push_str(&render_message(
             index,
@@ -184,12 +192,28 @@ pub fn apply_chat_template(
     Ok(prompt)
 }
 
+fn estimate_prompt_capacity(messages: &[ParsedMessage]) -> usize {
+    let mut capacity = 0usize;
+    for message in messages {
+        capacity += message.content.len();
+        capacity += message.reasoning_content.as_ref().map_or(0, String::len);
+        capacity += message
+            .tool_calls
+            .iter()
+            .map(|call| call.name.len() + call.arguments.len() + 64)
+            .sum::<usize>();
+        capacity += message.tools.len() * 64;
+        capacity += 64;
+    }
+    capacity
+}
+
 fn should_append_assistant_prompt(
     index: usize,
     all_messages: &[ParsedMessage],
     last_user_idx: isize,
 ) -> bool {
-    if index + 1 < all_messages.len() && all_messages[index + 1].role == "assistant" {
+    if index + 1 < all_messages.len() && all_messages[index + 1].role == ParsedRole::Assistant {
         return true;
     }
 
@@ -214,58 +238,29 @@ pub fn tokenize_messages(
     Ok((tokens, prompt))
 }
 
+fn parse_role(role: &str) -> ParsedRole {
+    match role {
+        "assistant" => ParsedRole::Assistant,
+        "system" => ParsedRole::System,
+        "developer" => ParsedRole::Developer,
+        "tool" => ParsedRole::Tool,
+        "bos" => ParsedRole::Bos,
+        "user" => ParsedRole::User,
+        _ => ParsedRole::User,
+    }
+}
+
 fn process_messages(messages: &[Message], drop_thinking: bool) -> Vec<ParsedMessage> {
-    let available_roles = ["user", "assistant", "system", "developer", "tool", "bos"];
-    let mut parsed_messages = Vec::new();
+    let mut parsed_messages = Vec::with_capacity(messages.len());
 
-    for (index, msg) in messages.iter().enumerate() {
-        if available_roles.contains(&msg.role.as_str()) {
-            parsed_messages.push(ParsedMessage {
-                role: msg.role.clone(),
-                content: msg.content.clone().unwrap_or_default(),
-                tools: msg.tools.clone().unwrap_or_default(),
-                response_format: msg.response_format.clone(),
-                tool_calls: normalize_tool_calls(msg.tool_calls.as_deref().unwrap_or(&[])),
-                reasoning_content: msg.reasoning_content.clone(),
-                dropped_reasoning: false,
-            });
-            continue;
-        }
-
-        if msg.role == "assistant"
-            && index + 1 < messages.len()
-            && messages[index + 1].role == "tool"
-        {
-            let mut tool_calls = normalize_tool_calls(msg.tool_calls.as_deref().unwrap_or(&[]));
-
-            if tool_calls.is_empty() {
-                let next_message = &messages[index + 1];
-                tool_calls.push(ToolCall {
-                    name: "unknown".to_string(),
-                    arguments: next_message.content.clone().unwrap_or_default(),
-                });
-            }
-
-            parsed_messages.push(ParsedMessage {
-                role: "assistant".to_string(),
-                content: msg.content.clone().unwrap_or_default(),
-                tools: Vec::new(),
-                response_format: None,
-                tool_calls,
-                reasoning_content: msg.reasoning_content.clone(),
-                dropped_reasoning: false,
-            });
-            continue;
-        }
-
+    for msg in messages {
         parsed_messages.push(ParsedMessage {
-            role: "user".to_string(),
+            role: parse_role(&msg.role),
             content: msg.content.clone().unwrap_or_default(),
-            tools: Vec::new(),
-            response_format: None,
-            tool_calls: Vec::new(),
-            reasoning_content: None,
-            dropped_reasoning: false,
+            tools: msg.tools.clone().unwrap_or_default(),
+            response_format: msg.response_format.clone(),
+            tool_calls: normalize_tool_calls(msg.tool_calls.as_deref().unwrap_or(&[])),
+            reasoning_content: msg.reasoning_content.clone(),
         });
     }
 
@@ -301,23 +296,22 @@ fn render_message(
     thinking_mode: ThinkingMode,
     last_user_idx: isize,
 ) -> Result<String, EncodeMessagesError> {
-    let role = message.role.as_str();
     let mut prompt = String::new();
 
-    match role {
-        "bos" => {
+    match message.role {
+        ParsedRole::Bos => {
             prompt.push_str(BOS_TOKEN);
             prompt.push_str(&message.content);
         }
-        "tool" => {
+        ParsedRole::Tool => {
             let mut prev_assistant_idx = index as isize - 1;
             while prev_assistant_idx >= 0
-                && all_messages[prev_assistant_idx as usize].role == "tool"
+                && all_messages[prev_assistant_idx as usize].role == ParsedRole::Tool
             {
                 prev_assistant_idx -= 1;
             }
             if prev_assistant_idx < 0
-                || all_messages[prev_assistant_idx as usize].role != "assistant"
+                || all_messages[prev_assistant_idx as usize].role != ParsedRole::Assistant
             {
                 return Err(EncodeMessagesError::InvalidToolMessageOrder);
             }
@@ -336,20 +330,21 @@ fn render_message(
             }
 
             let tool_call = &assistant_tool_calls[tool_call_order - 1];
-            let tool_call_id = format!("{}{}", tool_call.name, short_hash(&tool_call.arguments));
+            let tool_call_hash = short_hash(&tool_call.arguments);
 
             if tool_call_order == 1 {
                 prompt.push_str("\n\n<function_results>");
             }
 
-            prompt.push_str(&format!(
-                "{tool_output_begin}name={name}{tool_sep}{tool_call_id}\n{content}{tool_output_end}",
-                tool_output_begin = TOOL_OUTPUT_BEGIN_TOKEN,
-                name = tool_call.name,
-                tool_sep = TOOL_SEP_TOKEN,
-                content = message.content,
-                tool_output_end = TOOL_OUTPUT_END_TOKEN,
-            ));
+            prompt.push_str(TOOL_OUTPUT_BEGIN_TOKEN);
+            prompt.push_str("name=");
+            prompt.push_str(&tool_call.name);
+            prompt.push_str(TOOL_SEP_TOKEN);
+            prompt.push_str(&tool_call.name);
+            prompt.push_str(&tool_call_hash);
+            prompt.push('\n');
+            prompt.push_str(&message.content);
+            prompt.push_str(TOOL_OUTPUT_END_TOKEN);
 
             if tool_call_order == assistant_tool_calls.len() {
                 prompt.push_str("\n</function_results>");
@@ -362,61 +357,56 @@ fn render_message(
                 }
             }
         }
-        "assistant" => {
-            let tool_calls = if message.tool_calls.is_empty() {
-                String::new()
-            } else {
-                let mut parts = Vec::with_capacity(message.tool_calls.len());
-                for tool_call in &message.tool_calls {
-                    let tool_call_id =
-                        format!("{}{}", tool_call.name, short_hash(&tool_call.arguments));
-                    parts.push(format!(
-                        "{tool_call_begin}{name}{tool_sep}{tool_call_id}\n<{dsml}function={name}>\n{arguments}\n</{dsml}function>{tool_call_end}",
-                        tool_call_begin = TOOL_CALL_BEGIN_TOKEN,
-                        name = tool_call.name,
-                        tool_sep = TOOL_SEP_TOKEN,
-                        tool_call_id = tool_call_id,
-                        dsml = DSML_TOKEN,
-                        arguments = encode_arguments_to_dsml(&tool_call.arguments, &tool_call.name)?,
-                        tool_call_end = TOOL_CALL_END_TOKEN,
-                    ));
-                }
-                format!(
-                    "\n\n<function_calls>\n{}\n</function_calls>",
-                    parts.join("\n")
-                )
-            };
-
+        ParsedRole::Assistant => {
             let summary_content = message.content.as_str();
             let is_pending_assistant =
                 thinking_mode == ThinkingMode::Thinking && (index as isize) > last_user_idx;
-            let mut thinking_part = String::new();
-            if is_pending_assistant {
-                if message
+            if is_pending_assistant
+                && message
                     .reasoning_content
                     .as_deref()
                     .is_none_or(str::is_empty)
-                    && message.tool_calls.is_empty()
-                {
-                    return Err(EncodeMessagesError::MissingAssistantReasoning { index });
-                }
-
-                thinking_part = format!(
-                    "{}{}",
-                    message.reasoning_content.as_deref().unwrap_or_default(),
-                    THINKING_END_TOKEN
-                );
+                && message.tool_calls.is_empty()
+            {
+                return Err(EncodeMessagesError::MissingAssistantReasoning { index });
             }
 
-            prompt.push_str(&format!(
-                "{reasoning}{content}{tool_calls}{eos}",
-                reasoning = thinking_part,
-                content = summary_content,
-                tool_calls = tool_calls,
-                eos = EOS_TOKEN,
-            ));
+            if is_pending_assistant {
+                prompt.push_str(message.reasoning_content.as_deref().unwrap_or_default());
+                prompt.push_str(THINKING_END_TOKEN);
+            }
+            prompt.push_str(summary_content);
+            if !message.tool_calls.is_empty() {
+                prompt.push_str("\n\n<function_calls>\n");
+                for (tool_index, tool_call) in message.tool_calls.iter().enumerate() {
+                    if tool_index > 0 {
+                        prompt.push('\n');
+                    }
+                    let tool_call_hash = short_hash(&tool_call.arguments);
+                    let encoded_arguments =
+                        encode_arguments_to_dsml(&tool_call.arguments, &tool_call.name)?;
+                    prompt.push_str(TOOL_CALL_BEGIN_TOKEN);
+                    prompt.push_str(&tool_call.name);
+                    prompt.push_str(TOOL_SEP_TOKEN);
+                    prompt.push_str(&tool_call.name);
+                    prompt.push_str(&tool_call_hash);
+                    prompt.push('\n');
+                    prompt.push('<');
+                    prompt.push_str(DSML_TOKEN);
+                    prompt.push_str("function=");
+                    prompt.push_str(&tool_call.name);
+                    prompt.push_str(">\n");
+                    prompt.push_str(&encoded_arguments);
+                    prompt.push_str("\n</");
+                    prompt.push_str(DSML_TOKEN);
+                    prompt.push_str("function>");
+                    prompt.push_str(TOOL_CALL_END_TOKEN);
+                }
+                prompt.push_str("\n</function_calls>");
+            }
+            prompt.push_str(EOS_TOKEN);
         }
-        "system" => {
+        ParsedRole::System => {
             prompt.push_str(&message.content);
 
             if !message.tools.is_empty() {
@@ -444,7 +434,7 @@ fn render_message(
                 prompt.push_str("\n```\n");
             }
         }
-        "developer" => {
+        ParsedRole::Developer => {
             if message.content.is_empty() {
                 return Err(EncodeMessagesError::MissingDeveloperContent);
             }
@@ -494,7 +484,7 @@ fn render_message(
                 }
             }
         }
-        "user" => {
+        ParsedRole::User => {
             prompt.push_str(&format!(
                 "{user}{content}",
                 user = USER_TOKEN,
@@ -510,7 +500,6 @@ fn render_message(
                 }
             }
         }
-        _ => return Err(EncodeMessagesError::UnsupportedRole(role.to_string())),
     }
 
     Ok(prompt)
@@ -543,11 +532,9 @@ Here are the available tools:\n\n\
 }
 
 fn find_last_user_index(messages: &[ParsedMessage]) -> Option<usize> {
-    messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, msg)| (msg.role == "user" || msg.role == "developer").then_some(idx))
+    messages.iter().enumerate().rev().find_map(|(idx, msg)| {
+        (msg.role == ParsedRole::User || msg.role == ParsedRole::Developer).then_some(idx)
+    })
 }
 
 fn drop_thinking_messages(messages: &mut Vec<ParsedMessage>) {
@@ -556,9 +543,8 @@ fn drop_thinking_messages(messages: &mut Vec<ParsedMessage>) {
             .reasoning_content
             .as_deref()
             .is_some_and(|reasoning| !reasoning.is_empty());
-        if message.role == "assistant" && has_reasoning && !message.content.is_empty() {
+        if message.role == ParsedRole::Assistant && has_reasoning && !message.content.is_empty() {
             message.reasoning_content = None;
-            message.dropped_reasoning = true;
         }
     }
 
@@ -573,13 +559,13 @@ fn drop_thinking_messages(messages: &mut Vec<ParsedMessage>) {
             .is_some_and(|reasoning| !reasoning.is_empty());
         let has_content = !msg.content.is_empty();
 
-        if msg.role == "assistant" && has_reasoning && !has_content {
+        if msg.role == ParsedRole::Assistant && has_reasoning && !has_content {
             if assistant_start_idx.is_none() {
                 assistant_start_idx = Some(index);
             }
-        } else if msg.role == "assistant" && has_content {
+        } else if msg.role == ParsedRole::Assistant && has_content {
             assistant_start_idx = None;
-        } else if msg.role == "user" && assistant_start_idx.is_some() {
+        } else if msg.role == ParsedRole::User && assistant_start_idx.is_some() {
             let start = assistant_start_idx.expect("checked is_some");
             messages.drain(start..index);
             assistant_start_idx = None;
