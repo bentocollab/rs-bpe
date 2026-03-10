@@ -186,9 +186,7 @@ fn parse_messages(value: &Bound<'_, PyAny>) -> PyResult<Vec<::bpe_openai::deepse
     Ok(out)
 }
 
-fn parse_kimi_messages(
-    value: &Bound<'_, PyAny>,
-) -> PyResult<Vec<::bpe_openai::kimi_k2::Message>> {
+fn parse_kimi_messages(value: &Bound<'_, PyAny>) -> PyResult<Vec<::bpe_openai::kimi_k2::Message>> {
     let list = value
         .downcast::<PyList>()
         .map_err(|_| PyTypeError::new_err("messages must be a list of dict"))?;
@@ -494,6 +492,7 @@ impl Tokenizer {
         PyList::new(py, chunks)
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (messages, thinking_mode = "chat", context = None, drop_thinking = true, add_default_bos_token = true, tools = None, add_generation_prompt = true))]
     fn apply_chat_template(
         &self,

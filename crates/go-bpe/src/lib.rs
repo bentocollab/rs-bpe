@@ -52,6 +52,21 @@ pub extern "C" fn rsbpe_new_kimi_k2() -> *mut RsBpeTokenizer {
     Box::into_raw(Box::new(tok))
 }
 
+/// Create a new DeepSeek V3.2 tokenizer handle.
+///
+/// Returns a heap-allocated `RsBpeTokenizer` wrapping the static singleton.
+/// The caller owns the returned pointer and must free it with `rsbpe_free_tokenizer`.
+///
+/// # Safety
+/// The returned pointer is valid until freed with `rsbpe_free_tokenizer`.
+#[no_mangle]
+pub extern "C" fn rsbpe_new_deepseek_v32() -> *mut RsBpeTokenizer {
+    let tok = RsBpeTokenizer {
+        inner: bpe_openai::deepseek_32(),
+    };
+    Box::into_raw(Box::new(tok))
+}
+
 /// Encode a UTF-8 text string into token IDs.
 ///
 /// # Parameters
@@ -140,5 +155,27 @@ pub unsafe extern "C" fn rsbpe_free_tokens(tokens: *mut u32, len: usize) {
 pub unsafe extern "C" fn rsbpe_free_tokenizer(handle: *mut RsBpeTokenizer) {
     if !handle.is_null() {
         let _ = Box::from_raw(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deepseek_v32_handle_encodes_text() {
+        let handle = rsbpe_new_deepseek_v32();
+        assert!(!handle.is_null());
+
+        let text = "hello";
+        let result = unsafe { rsbpe_encode(handle, text.as_ptr() as *const c_char, text.len()) };
+
+        assert_eq!(result.error_code, 0);
+        assert!(result.len > 0);
+
+        unsafe {
+            rsbpe_free_tokens(result.tokens, result.len);
+            rsbpe_free_tokenizer(handle);
+        }
     }
 }
